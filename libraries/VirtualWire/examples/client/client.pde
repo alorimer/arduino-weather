@@ -6,16 +6,12 @@
 // should send a reply, which we will check
 //
 // See VirtualWire.h for detailed API docs
-// Author: Mike McCauley (mikem@open.com.au)
+// Author: Mike McCauley (mikem@airspayce.com)
 // Copyright (C) 2008 Mike McCauley
 // $Id: client.pde,v 1.1 2008/04/20 09:24:17 mikem Exp $
 
 #include <VirtualWire.h>
-#undef int
-#undef abs
-#undef double
-#undef float
-#undef round
+
 void setup()
 {
     Serial.begin(9600);	// Debugging only

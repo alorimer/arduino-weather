@@ -2,18 +2,35 @@
 //
 // Virtual Wire implementation for Arduino
 // See the README file in this directory fdor documentation
+// See also
+// ASH Transceiver Software Designer's Guide of 2002.08.07
+//   http://www.rfm.com/products/apnotes/tr_swg05.pdf
 //
 // Changes:
-// 2008-05-25: fixed a bug that could prevent messages with certain
+// 1.5 2008-05-25: fixed a bug that could prevent messages with certain
 //  bytes sequences being received (false message start detected)
+// 1.6 2011-09-10: Patch from David Bath to prevent unconditional reenabling of the receiver
+//  at end of transmission.
 //
-// Author: Mike McCauley (mikem@open.com.au)
+// Author: Mike McCauley (mikem@airspayce.com)
 // Copyright (C) 2008 Mike McCauley
-// $Id: VirtualWire.cpp,v 1.4 2009/03/31 20:49:41 mikem Exp mikem $
+// $Id: VirtualWire.cpp,v 1.9 2013/02/14 22:02:11 mikem Exp mikem $
 
-#include "WProgram.h"
+
+#if defined(ARDUINO)
+ #if (ARDUINO < 100)
+  #include "WProgram.h"
+ #endif
+#elif defined(__MSP430G2452__) || defined(__MSP430G2553__) // LaunchPad specific
+ #include "legacymsp430.h"
+ #include "Energia.h"
+#else // error
+ #error Platform not defined
+#endif
+
 #include "VirtualWire.h"
 #include <util/crc16.h>
+
 
 static uint8_t vw_tx_buf[(VW_MAX_MESSAGE_LEN * 2) + VW_HEADER_LEN] 
      = {0x2a, 0x2a, 0x2a, 0x2a, 0x2a, 0x2a, 0x38, 0x2c};
@@ -96,7 +113,7 @@ static uint8_t vw_rx_good = 0;
 // 4 bit to 6 bit symbol converter table
 // Used to convert the high and low nybbles of the transmitted data
 // into 6 bit symbols for transmission. Each 6-bit symbol has 3 1s and 3 0s 
-// with at most 2 consecutive identical bits
+// with at most 3 consecutive identical bits
 static uint8_t symbols[] =
 {
     0xd,  0xe,  0x13, 0x15, 0x16, 0x19, 0x1a, 0x1c, 
@@ -246,20 +263,139 @@ void vw_pll()
     }
 }
 
+// Common function for setting timer ticks @ prescaler values for speed
+// Returns prescaler index into {0, 1, 8, 64, 256, 1024} array
+// and sets nticks to compare-match value if lower than max_ticks
+// returns 0 & nticks = 0 on fault
+static uint8_t _timer_calc(uint16_t speed, uint16_t max_ticks, uint16_t *nticks)
+{
+    // Clock divider (prescaler) values - 0/3333: error flag
+    uint16_t prescalers[] = {0, 1, 8, 64, 256, 1024, 3333};
+    uint8_t prescaler=0; // index into array & return bit value
+    unsigned long ulticks; // calculate by ntick overflow
+
+    // Div-by-zero protection
+    if (speed == 0)
+    {
+        // signal fault
+        *nticks = 0;
+        return 0;
+    }
+
+    // test increasing prescaler (divisor), decreasing ulticks until no overflow
+    for (prescaler=1; prescaler < 7; prescaler += 1)
+    {
+        // Amount of time per CPU clock tick (in seconds)
+        float clock_time = (1.0 / (float(F_CPU) / float(prescalers[prescaler])));
+        // Fraction of second needed to xmit one bit
+        float bit_time = ((1.0 / float(speed)) / 8.0);
+        // number of prescaled ticks needed to handle bit time @ speed
+        ulticks = long(bit_time / clock_time);
+        // Test if ulticks fits in nticks bitwidth (with 1-tick safety margin)
+        if ((ulticks > 1) && (ulticks < max_ticks))
+        {
+            break; // found prescaler
+        }
+        // Won't fit, check with next prescaler value
+    }
+
+    // Check for error
+    if ((prescaler == 6) || (ulticks < 2) || (ulticks > max_ticks))
+    {
+        // signal fault
+        *nticks = 0;
+        return 0;
+    }
+
+    *nticks = ulticks;
+    return prescaler;
+}
+
+#if defined(__arm__) && defined(CORE_TEENSY)
+  // This allows the AVR interrupt code below to be run from an
+  // IntervalTimer object.  It must be above vw_setup(), so the
+  // the TIMER1_COMPA_vect function name is defined.
+  #ifdef SIGNAL
+  #undef SIGNAL
+  #endif
+  #define SIGNAL(f) void f(void)
+  #ifdef TIMER1_COMPA_vect
+  #undef TIMER1_COMPA_vect
+  #endif
+  void TIMER1_COMPA_vect(void);
+#endif
+
+
 // Speed is in bits per sec RF rate
+#if defined(__MSP430G2452__) || defined(__MSP430G2553__) // LaunchPad specific
 void vw_setup(uint16_t speed)
 {
-    // Calculate the OCR1A overflow count based on the required bit speed
-    // and CPU clock rate
-    uint16_t ocr1a = (F_CPU / 8UL) / speed;
+	// Calculate the counter overflow count based on the required bit speed
+	// and CPU clock rate
+	uint16_t ocr1a = (F_CPU / 8UL) / speed;
+		
+	// This code is for Energia/MSP430
+	TA0CCR0 = ocr1a;				// Ticks for 62,5 us
+	TA0CTL = TASSEL_2 + MC_1;       // SMCLK, up mode
+	TA0CCTL0 |= CCIE;               // CCR0 interrupt enabled
+		
+	// Set up digital IO pins
+	pinMode(vw_tx_pin, OUTPUT);
+	pinMode(vw_rx_pin, INPUT);
+	pinMode(vw_ptt_pin, OUTPUT);
+	digitalWrite(vw_ptt_pin, vw_ptt_inverted);
+}	
 
-#ifndef TEST
-    // Set up timer1 for a tick every 62.50 microseconds 
-    // for 2000 bits per sec
-    TCCR1A = 0;
-    TCCR1B = _BV(WGM12) | _BV(CS10);
+#elif defined (ARDUINO) // Arduino specific
+void vw_setup(uint16_t speed)
+{
+    uint16_t nticks; // number of prescaled ticks needed
+    uint8_t prescaler; // Bit values for CS0[2:0]
+
+#ifdef __AVR_ATtiny85__
+    // figure out prescaler value and counter match value
+    prescaler = _timer_calc(speed, (uint8_t)-1, &nticks);
+    if (!prescaler)
+    {
+        return; // fault
+    }
+
+    TCCR0A = 0;
+    TCCR0A = _BV(WGM01); // Turn on CTC mode / Output Compare pins disconnected
+
+    // convert prescaler index to TCCRnB prescaler bits CS00, CS01, CS02
+    TCCR0B = 0;
+    TCCR0B = prescaler; // set CS00, CS01, CS02 (other bits not needed)
+
+    // Number of ticks to count before firing interrupt
+    OCR0A = uint8_t(nticks);
+
+    // Set mask to fire interrupt when OCF0A bit is set in TIFR0
+    TIMSK |= _BV(OCIE0A);
+
+#elif defined(__arm__) && defined(CORE_TEENSY)
+    // on Teensy 3.0 (32 bit ARM), use an interval timer
+    IntervalTimer *t = new IntervalTimer();
+    t->begin(TIMER1_COMPA_vect, 125000.0 / (float)(speed));
+
+#else // ARDUINO
+    // This is the path for most Arduinos
+    // figure out prescaler value and counter match value
+    prescaler = _timer_calc(speed, (uint16_t)-1, &nticks);
+    if (!prescaler)
+    {
+        return; // fault
+    }
+
+    TCCR1A = 0; // Output Compare pins disconnected
+    TCCR1B = _BV(WGM12); // Turn on CTC mode
+
+    // convert prescaler index to TCCRnB prescaler bits CS10, CS11, CS12
+    TCCR1B |= prescaler;
+
     // Caution: special procedures for setting 16 bit regs
-    OCR1A = ocr1a;
+    // is handled by the compiler
+    OCR1A = nticks;
     // Enable interrupt
 #ifdef TIMSK1
     // atmega168
@@ -267,9 +403,9 @@ void vw_setup(uint16_t speed)
 #else
     // others
     TIMSK |= _BV(OCIE1A);
-#endif
+#endif // TIMSK1
 
-#endif
+#endif // __AVR_ATtiny85__
 
     // Set up digital IO pins
     pinMode(vw_tx_pin, OUTPUT);
@@ -278,6 +414,8 @@ void vw_setup(uint16_t speed)
     digitalWrite(vw_ptt_pin, vw_ptt_inverted);
 }
 
+#endif // ARDUINO
+
 // Start the transmitter, call when the tx buffer is ready to go and vw_tx_len is
 // set to the total number of symbols to send
 void vw_tx_start()
@@ -285,9 +423,6 @@ void vw_tx_start()
     vw_tx_index = 0;
     vw_tx_bit = 0;
     vw_tx_sample = 0;
-
-    // Disable the receiver PLL
-    vw_rx_enabled = false;
 
     // Enable the transmitter hardware
     digitalWrite(vw_ptt_pin, true ^ vw_ptt_inverted);
@@ -305,9 +440,6 @@ void vw_tx_stop()
 
     // No more ticks for the transmitter
     vw_tx_enabled = false;
-
-    // Enable the receiver PLL
-    vw_rx_enabled = true;
 }
 
 // Enable the receiver. When a message becomes available, vw_rx_done flag
@@ -325,6 +457,12 @@ void vw_rx_start()
 void vw_rx_stop()
 {
     vw_rx_enabled = false;
+}
+
+// Return true if the transmitter is active
+uint8_t vx_tx_active()
+{
+    return vw_tx_enabled;
 }
 
 // Wait for the transmitter to become available
@@ -405,44 +543,6 @@ uint8_t vw_send(uint8_t* buf, uint8_t len)
     return true;
 }
 
-// This is the interrupt service routine called when timer1 overflows
-// Its job is to output the next bit from the transmitter (every 8 calls)
-// and to call the PLL code if the receiver is enabled
-//ISR(SIG_OUTPUT_COMPARE1A)
-SIGNAL(TIMER1_COMPA_vect)
-{
-    vw_rx_sample = digitalRead(vw_rx_pin);
-
-    // Do transmitter stuff first to reduce transmitter bit jitter due 
-    // to variable receiver processing
-    if (vw_tx_enabled && vw_tx_sample++ == 0)
-    {
-        // Send next bit
-	// Symbols are sent LSB first
-        // Finished sending the whole message? (after waiting one bit period 
-	// since the last bit)
-        if (vw_tx_index >= vw_tx_len)
-	{
-	    vw_tx_stop();
-	    vw_tx_msg_count++;
-	}
-        else
-        {
-	    digitalWrite(vw_tx_pin, vw_tx_buf[vw_tx_index] & (1 << vw_tx_bit++));
-	    if (vw_tx_bit >= 6)
-	    {
-	        vw_tx_bit = 0;
-                vw_tx_index++;
-	    }
-        }
-    }
-    if (vw_tx_sample > 7)
-	vw_tx_sample = 0;
-
-    if (vw_rx_enabled)
-	vw_pll();
-}
-
 // Return true if there is a message available
 uint8_t vw_have_message()
 {
@@ -455,24 +555,114 @@ uint8_t vw_have_message()
 uint8_t vw_get_message(uint8_t* buf, uint8_t* len)
 {
     uint8_t rxlen;
-
+    
     // Message available?
     if (!vw_rx_done)
 	return false;
-
+    
     // Wait until vw_rx_done is set before reading vw_rx_len
     // then remove bytecount and FCS
     rxlen = vw_rx_len - 3;
-
+    
     // Copy message (good or bad)
     if (*len > rxlen)
 	*len = rxlen;
     memcpy(buf, vw_rx_buf + 1, *len);
-
+    
     vw_rx_done = false; // OK, got that message thanks
-
+    
     // Check the FCS, return goodness
     return (vw_crc(vw_rx_buf, vw_rx_len) == 0xf0b8); // FCS OK?
 }
+
+// This is the interrupt service routine called when timer1 overflows
+// Its job is to output the next bit from the transmitter (every 8 calls)
+// and to call the PLL code if the receiver is enabled
+//ISR(SIG_OUTPUT_COMPARE1A)
+#if defined (ARDUINO) // Arduino specific
+
+#ifdef __AVR_ATtiny85__
+SIGNAL(TIM0_COMPA_vect)
+#else // Assume Arduino Uno (328p or similar)
+
+SIGNAL(TIMER1_COMPA_vect)
+#endif // __AVR_ATtiny85__
+
+{
+    if (vw_rx_enabled && !vw_tx_enabled)
+	vw_rx_sample = digitalRead(vw_rx_pin);
+    
+    // Do transmitter stuff first to reduce transmitter bit jitter due 
+    // to variable receiver processing
+    if (vw_tx_enabled && vw_tx_sample++ == 0)
+    {
+	// Send next bit
+	// Symbols are sent LSB first
+	// Finished sending the whole message? (after waiting one bit period 
+	// since the last bit)
+	if (vw_tx_index >= vw_tx_len)
+	{
+	    vw_tx_stop();
+	    vw_tx_msg_count++;
+	}
+	else
+	{
+	    digitalWrite(vw_tx_pin, vw_tx_buf[vw_tx_index] & (1 << vw_tx_bit++));
+	    if (vw_tx_bit >= 6)
+	    {
+		vw_tx_bit = 0;
+		vw_tx_index++;
+	    }
+	}
+    }
+    if (vw_tx_sample > 7)
+	vw_tx_sample = 0;
+    
+    if (vw_rx_enabled && !vw_tx_enabled)
+	vw_pll();
+}
+#elif defined(__MSP430G2452__) || defined(__MSP430G2553__) // LaunchPad specific
+void vw_Int_Handler()
+{
+    if (vw_rx_enabled && !vw_tx_enabled)
+	vw_rx_sample = digitalRead(vw_rx_pin);
+    
+    // Do transmitter stuff first to reduce transmitter bit jitter due 
+    // to variable receiver processing
+    if (vw_tx_enabled && vw_tx_sample++ == 0)
+    {
+	// Send next bit
+	// Symbols are sent LSB first
+	// Finished sending the whole message? (after waiting one bit period 
+	// since the last bit)
+	if (vw_tx_index >= vw_tx_len)
+	{
+	    vw_tx_stop();
+	    vw_tx_msg_count++;
+	}
+	else
+	{
+	    digitalWrite(vw_tx_pin, vw_tx_buf[vw_tx_index] & (1 << vw_tx_bit++));
+	    if (vw_tx_bit >= 6)
+	    {
+		vw_tx_bit = 0;
+		vw_tx_index++;
+	    }
+	}
+    }
+    if (vw_tx_sample > 7)
+	vw_tx_sample = 0;
+    
+    if (vw_rx_enabled && !vw_tx_enabled)
+	vw_pll();
+}
+
+interrupt(TIMER0_A0_VECTOR) Timer_A_int(void) 
+{
+    vw_Int_Handler();
+};
+
+#endif
+
 
 }
