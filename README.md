@@ -1,7 +1,9 @@
 # arduino-weather
 > *Simple wireless weather station built on Arduino Nano boards.*
 
-For my engineering class at school I built a simple wireless weather station using two Arduino boards. It currently measures temperature, humidity and pressure, and transmits this data over 433 MHz for displaying on an LCD display. For more details on this project, read the report I wrote for school over here - **************.
+For my engineering class at school I built a simple wireless weather station using two Arduino boards. It currently measures temperature, humidity and pressure, and transmits this data over 433 MHz for displaying on an LCD display. For more details on this project, read the report I wrote for school over here - http://bit.ly/1RBwYhi.
+
+![Unavailable](http://i.imgur.com/kQyfSHV.jpg)
 
 ## Receiver
 The receiver code uses two libraries:
